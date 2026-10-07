@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+================================================================================
+프로젝트명: AAV's DS VER 1.0 (Advanced Air Vehicle Display Software v1.0)
+개발 기관: (주)제이앤에이치이엔지 (J&H ENG Co., Ltd.)
+개발 목적: 증강현실(AR) 및 미래비행체(AAV) 융합기술 기반 디스플레이 응용 소프트웨어
+파일 설명: 비행/운용 데이터 실시간 센서 융합, AR 시각화 오버레이 연산 및 
+          RESTful API 인터페이스 처리 핵심 엔진 모듈
+================================================================================
+"""
+
+import math
+import time
+import json
+import logging
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, List, Optional
+from flask import Flask, jsonify, request
+
+# ==========================================
+# 1. 로깅 및 시스템 설정을 위한 기본 구성
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] (AAV_DS_CORE) - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("AAV_DS_ENGINE")
+
+
+# ==========================================
+# 2. 센서 데이터 구조 정의 (Data Structures)
+# ==========================================
+@dataclass
+class GPSData:
+    latitude: float   # 위도 (deg)
+    longitude: float  # 경도 (deg)
+    altitude: float   # 고도 (m)
+
+@dataclass
+class IMUData:
+    pitch: float      # 피치 각도 (deg)
+    roll: float       # 롤 각도 (deg)
+    yaw: float        # 요(헤딩) 각도 (deg)
+
+@dataclass
+class SensorSuiteData:
+    eo_ir_detected_objects: List[Dict[str, Any]]  # EO/IR 카메라 탐지 객체 (위험요소 등)
+    lidar_obstacle_distance: float               # LiDAR 전방 최단 장애물 거리 (m)
+
+
+# ==========================================
+# 3. 비행체 데이터 융합 및 AR 시각화 처리 클래스
+# ==========================================
+class AAVDisplayEngine:
+    """
+    AAV's DS VER 1.0 핵심 프로세싱 엔진
+    GPS, IMU, EO/IR, LiDAR 데이터를 통합 센서 융합 처리하고
+    AR 화면 구성을 위한 그래픽 레이어 오버레이 좌표 데이터를 생성함.
+    """
+    def __init__(self):
+        self.system_status = "INITIALIZING"
+        self.last_update_time = time.time()
+        
+        # 내부 상태 저장소
+        self.current_gps = GPSData(0.0, 0.0, 0.0)
+        self.current_imu = IMUData(0.0, 0.0, 0.0)
+        self.current_sensors = SensorSuiteData([], 999.0)
+        
+        self.system_status = "READY"
+        logger.info("AAV's DS Engine 초기화 완료. 시스템 상태: READY")
+
+    def update_telemetry(self, gps_raw: dict, imu_raw: dict, sensor_raw: dict) -> bool:
+        """
+        외부 인터페이스로부터 입력을 받은 원시 센서 데이터를 내부 데이터 모델로 업데이트
+        """
+        try:
+            self.current_gps = GPSData(**gps_raw)
+            self.current_imu = IMUData(**imu_raw)
+            self.current_sensors = SensorSuiteData(
+                eo_ir_detected_objects=sensor_raw.get("eo_ir_objects", []),
+                lidar_obstacle_distance=sensor_raw.get("lidar_min_dist", 999.0)
+            )
+            self.last_update_time = time.time()
+            return True
+        except Exception as e:
+            logger.error(f"원시 데이터 구문 분석 중 오류 발생: {str(e)}")
+            return False
+
+    def process_ar_overlay_layers(self) -> Dict[str, Any]:
+        """
+        [핵심 알고리즘] 비행 데이터 및 주변 환경 데이터를 AR 조종 디스플레이용
+        상태 오버레이 정보로 실시간 융합 연산
+        """
+        # 1. 위험 요소 평가 (LiDAR/EO-IR 센서 기반)
+        hazard_warning = False
+        warning_level = "CLEAR"
+        
+        if self.current_sensors.lidar_obstacle_distance < 50.0:  # 50m 이내 근접 시 경고
+            hazard_warning = True
+            warning_level = "CRITICAL_COLLISION_RISK"
+        elif self.current_sensors.lidar_obstacle_distance < 150.0:
+            hazard_warning = True
+            warning_level = "WARNING_OBSTACLE_AHEAD"
+
+        # 2. AR 렌더링용 HUD 롤/피치 가상 인공수평선(Artificial Horizon) 좌표 계산
+        # AR HUD 화면 중앙 좌표를 (0,0)으로 가정했을 때의 픽셀/각도 변환 오프셋 연산
+        pitch_offset_px = self.current_imu.pitch * 5.0  # 1도당 5픽셀 이동
+        roll_angle_deg = self.current_imu.roll
+
+        # 3. 최종 조종자 인터페이스(UI/UX) 출력 데이터 패키징
+        ar_display_frame = {
+            "timestamp": self.last_update_time,
+            "flight_telemetry": {
+                "position": asdict(self.current_gps),
+                "attitude": asdict(self.current_imu)
+            },
+            "ar_hud_elements": {
+                "artificial_horizon": {
+                    "pitch_offset": pitch_offset_px,
+                    "roll_rotation": roll_angle_deg
+                },
+                "heading_indicator": self.current_imu.yaw,
+                "target_bounding_boxes": self.current_sensors.eo_ir_detected_objects
+            },
+            "safety_alerts": {
+                "hazard_detected": hazard_warning,
+                "warning_level": warning_level,
+                "min_obstacle_distance_m": self.current_sensors.lidar_obstacle_distance
+            }
+        }
+        
+        return ar_display_frame
+
+
+# ==========================================
+# 4. RESTful API 서비스 구현 (외부 연동용)
+# ==========================================
+app = Flask(__name__)
+engine = AAVDisplayEngine()
+
+@app.route('/api/v1/health', methods=['GET'])
+def health_check():
+    """
+    시스템 헬스 체크 API Endpoint
+    """
+    return jsonify({
+        "status": engine.system_status,
+        "service": "AAV's DS VER 1.0 Core Engine",
+        "timestamp": time.time()
+    }), 200
+
+@app.route('/api/v1/telemetry', methods=['POST'])
+def receive_telemetry():
+    """
+    외부 센서(GPS, IMU, LiDAR 등) 데이터 수신 API Endpoint
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Bad Request - JSON body required"}), 400
+
+        gps = data.get("gps", {})
+        imu = data.get("imu", {})
+        sensors = data.get("sensors", {})
+
+        success = engine.update_telemetry(gps, imu, sensors)
+        if success:
+            return jsonify({"result": "SUCCESS", "message": "Telemetry updated"}), 200
+        else:
+            return jsonify({"result": "FAIL", "message": "Data parsing failed"}), 400
+
+    except Exception as e:
+        logger.error(f"API 요청 처리 실패: {str(e)}")
+        return jsonify({"result": "ERROR", "message": str(e)}), 500
+
+@app.route('/api/v1/ar-display-data', methods=['GET'])
+def get_ar_display_data():
+    """
+    디스플레이 장비로 시각화용 AR 오버레이 데이터 전송 API Endpoint
+    """
+    display_data = engine.process_ar_overlay_layers()
+    return jsonify(display_data), 200
+
+
+# ==========================================
+# 5. 메인 실행부 (Main Entrypoint)
+# ==========================================
+if __name__ == '__main__':
+    logger.info("=====================================================")
+    logger.info("AAV's DS VER 1.0 - Application Starting")
+    logger.info("Developer: J&H ENG Co., Ltd.")
+    logger.info("=====================================================")
+    
+    # 개발/테스트용 개발 서버 실행 (포트: 5000)
+    # 실제 운용 환경 구축 시 Gunicorn, uWSGI 등 Production WSGI 활용 권장
+    app.run(host='0.0.0.0', port=5000, debug=False)
